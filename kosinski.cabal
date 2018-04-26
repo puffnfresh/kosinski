@@ -25,3 +25,15 @@ test-suite kosinski-tests
                      , kosinski
                      , tasty
                      , tasty-hunit
+  default-language:    Haskell2010
+
+benchmark kosinski-benchmarks
+  main-is:             benchmark/Main.hs
+  type:                exitcode-stdio-1.0
+  build-depends:       base
+                     , bytestring
+                     , filepath
+                     , time
+                     , kosinski
+                     , deepseq
+  default-language:    Haskell2010
