@@ -5,12 +5,15 @@ module Codec.Compression.Kosinski (
 , decompress
 ) where
 
-import Control.Lens
-import Data.Bits
-import Data.Bits.Lens
-import Data.Maybe
-import Data.Word
-import qualified Data.ByteString as BS
+import           Control.Lens
+import           Data.Bits
+import           Data.Bits.Lens
+import qualified Data.ByteString  as BS
+import           Data.Maybe
+import           Data.Semigroup   ((<>))
+import qualified Data.Vector      as V
+import           Data.Vector.Lens
+import           Data.Word
 
 data Compressed
   = Compressed Word8 Word8 [Word8]
@@ -28,11 +31,11 @@ compressedFile fp =
 
 decompress :: Compressed -> Maybe [Word8]
 decompress (Compressed h1 h2 s) =
-  f (headerBits h1 h2) s []
+  V.toList <$> f (headerBits h1 h2) s mempty
   where
     -- Uncompressed
     f (True:x:xs) (a:as) d =
-      f (x:xs) as $ d ++ [a]
+      f (x:xs) as $ V.snoc d a
 
     -- End of header
     f (x:y:[]) (a:b:as) d =
@@ -78,9 +81,9 @@ decompress (Compressed h1 h2 s) =
     f _ _ _ =
       Nothing
 
-dict :: Int -> Int -> [a] -> [a]
+dict :: Int -> Int -> V.Vector a -> V.Vector a
 dict offset count d =
-  d ++ d ^.. taking (count + 1) (repeated . dropping i traverse)
+  d <> toVectorOf (taking (count + 1) (repeated . dropping i traverse)) d
   where
     i =
       length d + offset
