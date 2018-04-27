@@ -1,3 +1,6 @@
+{-# LANGUAGE FlexibleContexts      #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+
 module Codec.Compression.Kosinski (
   Compressed(..)
 , compressed
@@ -6,88 +9,165 @@ module Codec.Compression.Kosinski (
 ) where
 
 import           Control.Lens
+import           Control.Monad           (unless, when)
+import           Control.Monad.Except    (MonadError, throwError)
+import           Control.Monad.State     (MonadState, execStateT)
 import           Data.Bits
-import           Data.Bits.Lens
-import qualified Data.ByteString  as BS
-import           Data.Maybe
-import           Data.Semigroup   ((<>))
-import qualified Data.Vector      as V
-import           Data.Vector.Lens
-import           Data.Word
+import qualified Data.ByteString         as BS
+import           Data.ByteString.Builder
+import qualified Data.ByteString.Lazy    as BSL
+import           Data.Int                (Int64)
+import           Data.Maybe              (fromMaybe, maybe)
+import           Data.Semigroup          (stimes, (<>))
+import           Data.Word               (Word16, Word8)
 
 data Compressed
-  = Compressed Word8 Word8 [Word8]
+  = Compressed Int Word16 BS.ByteString
   deriving (Eq, Ord, Show)
 
-compressed :: BS.ByteString -> Maybe Compressed
-compressed bs = do
+data DecompressState
+  = DecompressState Builder Compressed
+
+builder_ :: Lens' DecompressState Builder
+builder_ =
+  lens f g
+  where
+    f (DecompressState a _) =
+      a
+    g (DecompressState _ b) a =
+      DecompressState a b
+
+class HasCompressed m where
+  compressed_ :: Lens' m Compressed
+
+instance HasCompressed Compressed where
+  compressed_ =
+    id
+
+instance HasCompressed DecompressState where
+  compressed_ =
+    lens f g
+    where
+      f (DecompressState _ b) =
+        b
+      g (DecompressState a _) b =
+        DecompressState a b
+
+unconsWord16 :: BS.ByteString -> Maybe (Word16, BS.ByteString)
+unconsWord16 bs = do
   (a, bs') <- BS.uncons bs
   (b, bs'') <- BS.uncons bs'
-  pure . Compressed a b $ BS.unpack bs''
+  pure ((fromIntegral b `shiftL` 8) .|. fromIntegral a, bs'')
 
 compressedFile :: FilePath -> IO (Maybe Compressed)
-compressedFile fp =
-  compressed <$> BS.readFile fp
+compressedFile =
+  fmap compressed . BS.readFile
 
-decompress :: Compressed -> Maybe [Word8]
-decompress (Compressed h1 h2 s) =
-  V.toList <$> f (headerBits h1 h2) s mempty
+compressed :: BS.ByteString -> Maybe Compressed
+compressed =
+  fmap f . unconsWord16
   where
-    -- Uncompressed
-    f (True:x:xs) (a:as) d =
-      f (x:xs) as $ V.snoc d a
+    f (b, bs) =
+      Compressed 0 b bs
 
-    -- End of header
-    f (x:y:[]) (a:b:as) d =
-      f (x:y:headerBits a b) as d
+nextIsNull :: (HasCompressed s, MonadState s m) => m Bool
+nextIsNull = do
+  Compressed _ _ bs <- use compressed_
+  pure $ BS.null bs
 
-    -- Full
-    f (False:True:xs) (l:h:as) d = do
-      let h' = fromIntegral h
-          count = h' .&. 0x7 :: Int
-          l' = fromIntegral l
-          h'' = shiftL (0xF8 .&. h') 5
-          offset = complement 0x1FFF .|. h'' .|. l'
+nextBit :: (HasCompressed s, MonadError () m, MonadState s m) => m Bool
+nextBit = do
+  Compressed r b bs <- use compressed_
+  let
+    r' =
+      r + 1
+    c =
+      fromMaybe (Compressed 0 0 mempty) (compressed bs)
+    c' =
+      if (r' > 0xF)
+      then c
+      else Compressed r' b bs
+  compressed_ .= c'
+  pure $ testBit b r
 
-      if count == 0
-        then do
-          count' <- fromIntegral <$> listToMaybe as
-          if count' == 0
-            then pure d
-            else if count' == 1
-                 then f xs (drop 1 as) d
-                 else f xs (drop 1 as) $ dict offset count' d
-        else f xs as $ dict offset (count + 1) d
+nextByte :: (HasCompressed s, MonadError () m, MonadState s m) => m Word8
+nextByte = do
+  Compressed r b bs <- use compressed_
+  (b', bs') <- maybe (throwError ()) pure $ BS.uncons bs
+  compressed_ .= Compressed r b bs'
+  pure b'
 
-    -- End of header
-    f (w:x:y:z:[]) (a:b:as) d =
-      f (w:x:y:z:headerBits a b) as d
+checkEndOfStream :: (HasCompressed s, MonadState s m) => m () -> m ()
+checkEndOfStream m = do
+  n <- nextIsNull
+  unless n m
 
-    -- Inline
-    f (False:False:l:h:xs) (o:as) d = do
-      let count = (if l then 2 else 0) + (if h then 1 else 0) + 1
-          offset = fromIntegral o .|. complement 0xFF
-      f xs as (dict offset count d)
+tell :: MonadState DecompressState m => Builder -> m ()
+tell =
+  (builder_ <>=)
 
-    -- End of header
-    f h (a:b:as) d =
-      f (h ++ headerBits a b) as d
+modifyByteString :: MonadState DecompressState m => (BSL.ByteString -> Builder) -> m ()
+modifyByteString f =
+  builder_ %= \b -> b <> f (toLazyByteString b)
 
-    -- End of data
-    f _ [] c =
-      pure c
+handleUncompressed :: (MonadError () m, MonadState DecompressState m) => m ()
+handleUncompressed = do
+  b <- nextByte
+  tell $ word8 b
+  decompress'
 
-    -- Unknown data
-    f _ _ _ =
-      Nothing
-
-dict :: Int -> Int -> V.Vector a -> V.Vector a
-dict offset count d =
-  d <> toVectorOf (taking (count + 1) (repeated . dropping i traverse)) d
+dictBuilder :: Int64 -> Int64 -> BSL.ByteString -> Builder
+dictBuilder offset count d =
+  lazyByteString c
   where
+    c =
+      BSL.take (count + 1) . stimes (count + 1) $ BSL.drop i d
     i =
-      length d + offset
+      BSL.length d + offset
 
-headerBits :: (Bits b, Num b) => b -> b -> [Bool]
-headerBits =
-  curry . toListOf $ both . bits
+handleFull :: (MonadError () m, MonadState DecompressState m) => m ()
+handleFull = do
+  l <- nextByte
+  h <- nextByte
+  let h' = fromIntegral h
+      count = h' .&. 0x7 :: Int64
+      l' = fromIntegral l
+      h'' = shiftL (0xF8 .&. h') 5
+      offset = complement 0x1FFF .|. h'' .|. l'
+  if count == 0
+  then checkEndOfStream $ do
+    count' <- nextByte
+    when (count' /= 0) $
+      if count' == 1
+      then decompress'
+      else do
+        modifyByteString . dictBuilder offset $ fromIntegral count'
+        decompress'
+  else do
+    modifyByteString . dictBuilder offset $ count + 1
+    decompress'
+
+handleInline :: (MonadError () m, MonadState DecompressState m) => m ()
+handleInline = do
+  l <- nextBit
+  h <- nextBit
+  o <- nextByte
+  let count = (if l then 2 else 0) + (if h then 1 else 0) + 1
+      offset = fromIntegral o .|. complement 0xFF
+  modifyByteString $ dictBuilder offset count
+  decompress'
+
+decompress' :: (MonadError () m, MonadState DecompressState m) => m ()
+decompress' = checkEndOfStream $ do
+  isUncompressed <- nextBit
+  if isUncompressed
+  then handleUncompressed
+  else checkEndOfStream $ do
+    isFull <- nextBit
+    if isFull
+    then handleFull
+    else handleInline
+
+decompress :: Compressed -> Maybe BS.ByteString
+decompress =
+  fmap (BSL.toStrict . toLazyByteString . view builder_) . execStateT decompress' . DecompressState mempty
